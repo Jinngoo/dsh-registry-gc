@@ -1,7 +1,7 @@
 {
   "name": "@jinngoo/dsh-registry-gc",
   "version": "0.1.0",
-  "description": "DSH 注册表垃圾回收：把 workspace.json 里指向已不存在会话的悬空 id（archivedSessionIds / sessionIds 槽位）通过官方 unarchiveSession 通道清掉",
+  "description": "DSH 注册表垃圾回收：清理 workspace.json 里指向已不存在会话的悬空 id（归档集合、置顶集合与工作区隐藏槽位），全部走官方注册表接口，绝不直接改注册表文件",
   "author": "Jinngoo <jinngoo@qq.com> (https://github.com/Jinngoo)",
   "license": "MIT",
   "keywords": [

@@ -26,20 +26,21 @@ WorkspaceRegistry#unarchiveSession(id)  「不做会话存在性检查，因为�
 WorkspaceRegistry#unpinSession(id)
 ```
 
-`Workspace#detachSession(id)` 也接好了（同样是幂等的），但如上所述它正常不会被调用——它留在代码里是为了将来注册表若暴露原始记录可以直接用。
+`Workspace#detachSession(id)` 也接好了（同样幂等），但正常不会被调用——因为失效槽位对插件不可见，指名删除无从谈起；它留在代码里是为将来注册表若暴露原始记录可直接用。
 
 ## 用法
 
-**自动**：挂载后，进程内首次创建 Agent 的 15 秒后自动跑一遍（`startDelaySeconds` 可调），只在确实有悬空 id 时才动手。
+**自动**：挂载后，进程内首次创建 Agent 的 15 秒后自动跑一遍（`startDelaySeconds` 可调）。只在确实有悬空 id 时才动手；若开了 `sweepSlotsOnStart`，则即使计划为空也会扫一遍槽位。
 
 **手动**：模型可调 `registry_gc` 工具，默认 `dryRun: true` 只报告：
 
 ```jsonc
 // registry_gc { dryRun: true }  ->  只读报告
-{ "ok": true, "dryRun": true, "cleaned": 23, "archived": 23, "pinned": 0, "slots": 21,
-  "workspaces": [{ "workspaceId": "...", "title": "DSH_Bot", "ids": 5 }] }
+{ "ok": true, "dryRun": true, "cleaned": 23, "archived": 23, "pinned": 0,
+  "slots": 0, "swept": 0, "errors": [] }
 
-// registry_gc { dryRun: false } ->  真正清理
+// registry_gc { dryRun: false }                 -> 真正清全局两个集合
+// registry_gc { dryRun: false, sweepSlots: true } -> 顺带重写工作区记录，剪除隐藏槽位
 ```
 
 ## 配置
@@ -89,15 +90,29 @@ const sessionIds = changed.sessionIds.filter(id => this.host.candidateMatches(id
 
 ## 当前实测（本机 2026-11-21）
 
+一次完整的「清理后收尾」全流程：
+
+| 阶段 | archivedSessionIds 悬空 | 工作区悬空槽位 |
+|---|---|---|
+| 用 `dsh-session-janitor` 删掉 23 个归档会话后 | 23 | 19 |
+| 重启 DSH（插件自动跑一遍） | **0** | 19 |
+| 开启 `sweepSlotsOnStart` 再重启 | **0** | **0** |
+
+第二行说明了一件事：只靠全局集合的清理，槽位残留不会自己消失——必须有那次写入。第三行把 `sessionIds` 从 19/19/3 降到 10/10/2（六个工作区各自剪掉了失效项）。
+
+没有悬空 id 时插件是空操作，第二次跑 `cleaned` 必为 0，这本身就是幂等性验证。
+
+## 配套使用
+
+本插件只做注册表收尾，**不删任何文件**。删会话日志靠技能 `dsh-session-janitor`（纯 Node 脚本，可脱离 DSH 运行）：
+
 ```
-持久化里的会话: 70
-archivedSessionIds: 26   -> 悬空 0
-pinnedSessionIds: 0      -> 悬空 0
-workspaces: 6            -> 悬空槽位 0
-去重后需清理的会话数: 0
+停 DSH → node scripts/janitor.mjs apply --backup → 重启 DSH
+                                                      ↓
+                                          registry-gc 自动清掉悬空 id
 ```
 
-没有悬空 id 时插件是空操作——这本身就是幂等性验证。真正的清理会在用 `dsh-session-janitor` 删掉归档会话后，于下次启动自动完成。
+顺序反过来（先启动再删文件）不会出错，只是残留要等下一次启动才清。
 
 ## 开发
 
@@ -108,4 +123,4 @@ pnpm test
 pnpm build
 ```
 
-`src/plan.ts` 是纯决策逻辑（无服务、无时钟），`src/index.ts` 只做装配。
+`src/plan.ts` 是纯决策逻辑（无服务、无时钟），`src/index.ts` 只做装配。25 项测试覆盖：纯决策、装配调用序列、`dryRun` 零写入、二次运行幂等、并发消失容错、定时器只武装一次、槽位清扫（默认不动 / 全量重写并剪除 / 标题不变 / dry-run 不扫 / 启动时空计划也扫）。
