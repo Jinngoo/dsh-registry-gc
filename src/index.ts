@@ -48,11 +48,21 @@ export interface Config {
   readonly collectOnStart: boolean
   /** Seconds to wait after the first Agent appears before the automatic pass. */
   readonly startDelaySeconds: number
+  /**
+   * Also rewrite every workspace record once, so the registry prunes the slots
+   * it hides from us.
+   *
+   * Off by default: it restamps every workspace's `updatedAt`, which changes
+   * `updatedAt` ordering for any consumer that sorts by it. Turn it on when
+   * stale slots matter more than that timestamp.
+   */
+  readonly sweepSlotsOnStart: boolean
 }
 
 export const Config: Schema<Config> = Schema.object({
   collectOnStart: Schema.boolean().default(true),
   startDelaySeconds: Schema.number().default(15),
+  sweepSlotsOnStart: Schema.boolean().default(false),
 })
 
 export const name = 'registry-gc'
@@ -71,6 +81,8 @@ interface GcResult {
   readonly archived: number
   readonly pinned: number
   readonly slots: number
+  /** Workspace records rewritten so their hidden slots were pruned. */
+  readonly swept: number
   readonly workspaces: readonly { readonly workspaceId: string; readonly title: string; readonly ids: number }[]
   readonly errors: readonly string[]
 }
@@ -118,12 +130,17 @@ export function apply(ctx: Context, config: Config): void {
    * the registry may one day expose raw records, and the cost of an empty loop is
    * one comparison. Global sets are removed after slots so an interrupted pass
    * leaves the smaller, resumable remainder — every call is idempotent.
+   * @param plan - what to remove.
+   * @param dryRun - report only.
+   * @param sweepSlots - rewrite every workspace record so `mutate` prunes the
+   *   slots it hides from this row. Opt-in because it restamps `updatedAt`.
    */
-  const collect = async (plan: GcPlan, dryRun: boolean): Promise<GcResult> => {
+  const collect = async (plan: GcPlan, dryRun: boolean, sweepSlots = false): Promise<GcResult> => {
     const errors: string[] = []
     let archived = 0
     let pinned = 0
     let slots = 0
+    let swept = 0
 
     const workspaces = plan.staleSlots.map((slot) => ({
       workspaceId: slot.workspaceId,
@@ -139,6 +156,7 @@ export function apply(ctx: Context, config: Config): void {
         archived: plan.staleArchived.length,
         pinned: plan.stalePinned.length,
         slots: plan.staleSlots.reduce((sum, slot) => sum + slot.sessionIds.length, 0),
+        swept: 0,
         workspaces,
         errors,
       }
@@ -178,9 +196,38 @@ export function apply(ctx: Context, config: Config): void {
       }
     }
 
+    // Last step: walk every workspace and re-apply its own title.
+    //
+    // Why this is needed: `Workspace#sessionIds` is a getter that filters the
+    // durable record through `candidateMatches`, so a slot whose session is gone
+    // is invisible — the planner above literally cannot see it, and no public API
+    // exposes the raw array. The only way to drop those slots is to make the
+    // registry write the record, because `mutate()` prunes non-matching
+    // candidates on every accepted mutation.
+    //
+    // Re-applying the same title parses as a change: `setTitle` builds a fresh
+    // object (`{ ...record, title }`), so `mutate`'s `changed === current`
+    // identity check never short-circuits and the write happens. The pruning is a
+    // side effect of that write, not something the title participates in.
+    //
+    // Known cost, accepted deliberately: `mutate()` also restamps `updatedAt`, so
+    // every swept workspace looks "touched now". That only affects ordering, and
+    // only for callers that sort by it.
+    if (sweepSlots) {
+      for (const workspace of ctx.workspaceRegistry.list()) {
+        try {
+          await workspace.setTitle(workspace.title)
+          swept += 1
+        } catch (error) {
+          errors.push(`sweep ${workspace.id}: ${error instanceof Error ? error.message : String(error)}`)
+        }
+      }
+    }
+
     ctx.logger.info(
       `registry-gc: 清理 ${String(plan.totalIds)} 个悬空 id`
-      + `（归档 ${String(archived)}、置顶 ${String(pinned)}、工作区槽位 ${String(slots)}）`,
+      + `（归档 ${String(archived)}、置顶 ${String(pinned)}、工作区槽位 ${String(slots)}）`
+      + `${sweepSlots ? `，并重写 ${String(swept)} 个工作区记录以剪除不可见槽位` : ''}`,
     )
 
     return {
@@ -190,6 +237,7 @@ export function apply(ctx: Context, config: Config): void {
       archived,
       pinned,
       slots,
+      swept,
       workspaces,
       errors,
     }
@@ -198,11 +246,17 @@ export function apply(ctx: Context, config: Config): void {
   ctx.tools.register(defineTool({
     name: 'registry_gc',
     description:
-      '清理 workspace.json 里指向已不存在会话的悬空 id：全局归档集合、置顶集合，以及各工作区的会话槽位。'
-      + '通过官方 detachSession / unarchiveSession / unpinSession 通道完成，绝不直接改注册表文件。'
-      + 'dryRun=true（默认）只报告会清多少，不改动。',
+      '清理 workspace.json 里指向已不存在会话的悬空 id：全局归档集合与置顶集合（这两处不受任何过滤，会永久残留）。'
+      + '通过官方 unarchiveSession / unpinSession 通道完成，绝不直接改注册表文件。'
+      + 'sweepSlots=true 时会额外重写每个工作区记录一次——工作区槽位被 getter 过滤后本插件看不见，'
+      + '只能靠触发一次写操作让注册表自己剪除；代价是所有工作区的 updatedAt 会被刷新。'
+      + 'dryRun=true（默认）只报告，不改动。',
     parameters: {
       dryRun: { type: 'boolean' as const, description: '只报告，不做任何改动（默认 true）' },
+      sweepSlots: {
+        type: 'boolean' as const,
+        description: '额外重写每个工作区记录以剪除不可见槽位（会刷新 updatedAt，默认 false）',
+      },
     },
     output: {
       schema: { type: 'json' } as const,
@@ -212,8 +266,9 @@ export function apply(ctx: Context, config: Config): void {
     },
     async execute(args): Promise<JsonValue> {
       const dryRun = args.dryRun !== false
+      const sweepSlots = args.sweepSlots === true
       const plan = planGc(await snapshot())
-      const result = await collect(plan, dryRun)
+      const result = await collect(plan, dryRun, sweepSlots)
       // GcResult is a plain JSON object; the assertion is only about the
       // recursive JsonValue union, not about shape.
       return result as unknown as JsonValue
@@ -226,6 +281,10 @@ export function apply(ctx: Context, config: Config): void {
   // keeps this a single listener instead of one per Agent scope. The delay lets
   // the first turn start before the registry is touched, so a slow disk never
   // delays session creation.
+  //
+  // The empty-plan shortcut only skips the *global set* work: a slot sweep is
+  // independent of the plan (the plan cannot even see the slots), so skipping it
+  // on an empty plan would leave those slots forever.
   let armed = true
   ctx.on('agent/created', () => {
     if (!armed) return
@@ -234,8 +293,8 @@ export function apply(ctx: Context, config: Config): void {
       void (async () => {
         try {
           const plan = planGc(await snapshot())
-          if (isEmptyPlan(plan)) return
-          await collect(plan, false)
+          if (isEmptyPlan(plan) && !config.sweepSlotsOnStart) return
+          await collect(plan, false, config.sweepSlotsOnStart)
         } catch (error) {
           ctx.logger.warn(
             `registry-gc: 自动清理失败：${error instanceof Error ? error.message : String(error)}`,

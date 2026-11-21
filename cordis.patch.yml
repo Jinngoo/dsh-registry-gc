@@ -12,3 +12,6 @@
         collectOnStart: true
         # 等首轮开始后再动注册表，避免拖慢会话创建。
         startDelaySeconds: 15
+        # 额外重写每个工作区记录，让注册表剪掉被 getter 隐藏的失效槽位。
+        # 代价：所有工作区的 updatedAt 会被刷新（只影响按它排序的调用方）。
+        sweepSlotsOnStart: true

@@ -13,11 +13,12 @@ import { apply, Config } from '../src/index.ts'
 
 interface FakeWorkspace {
   id: string
-  title: string
-  /** The durable record the real entity owns; `sessionIds` is derived from it. */
-  record: { sessionIds: string[] }
-  sessionIds: readonly string[]
+  readonly title: string
+  /** The durable record the real entity owns; `sessionIds` and `title` derive from it. */
+  record: { sessionIds: string[], title: string }
+  readonly sessionIds: readonly string[]
   detachSession: (id: string) => Promise<void>
+  setTitle: (title: string) => Promise<void>
 }
 
 /**
@@ -40,10 +41,14 @@ function makeContext(options: {
   const calls: string[] = []
 
   const workspaces = (options.workspaces ?? []).map((workspace) => {
-    const record = { sessionIds: [...workspace.sessionIds] }
+    const record = { sessionIds: [...workspace.sessionIds], title: workspace.title }
     const fake: FakeWorkspace = {
       id: workspace.id,
-      title: workspace.title,
+      get title() {
+        // Real `setTitle` restamps the record; keep the title a plain field so a
+        // same-value call still counts as a write, exactly like the real one.
+        return record.title
+      },
       record,
       get sessionIds() {
         // Exactly what WorkspaceEntity#sessionIds does.
@@ -53,6 +58,13 @@ function makeContext(options: {
         calls.push(`detach:${workspace.id}:${id}`)
         const index = record.sessionIds.indexOf(id)
         if (index >= 0) record.sessionIds.splice(index, 1)
+      },
+      async setTitle(title: string) {
+        calls.push(`setTitle:${workspace.id}:${title}`)
+        // Mirror `mutate()`: the write prunes non-matching candidates, and it
+        // happens even when the title is unchanged.
+        record.title = title
+        record.sessionIds = record.sessionIds.filter((id) => liveSet.has(id))
       },
     }
     return fake
@@ -287,10 +299,118 @@ describe('apply', () => {
   })
 })
 
+describe('slot sweep', () => {
+  it('does not touch workspace records unless sweepSlots is requested', async () => {
+    const fake = makeContext({
+      live: [],
+      workspaces: [{ id: 'w1', title: 'W1', sessionIds: ['gone'] }],
+    })
+    apply(fake.ctx as never, { collectOnStart: false, startDelaySeconds: 0 })
+
+    await fake.tools[0]?.execute({ dryRun: false })
+
+    expect(fake.calls.filter((call) => call.startsWith('setTitle'))).toEqual([])
+    // The hidden slot survives, which is the whole reason the sweep exists.
+    expect(fake.workspaces[0]?.record.sessionIds).toEqual(['gone'])
+  })
+
+  it('rewrites every workspace and prunes the slots it could not see', async () => {
+    const fake = makeContext({
+      live: ['alive'],
+      workspaces: [
+        { id: 'w1', title: 'W1', sessionIds: ['alive', 'gone-a', 'gone-b'] },
+        { id: 'w2', title: 'W2', sessionIds: ['gone-c'] },
+        { id: 'w3', title: 'W3', sessionIds: ['alive'] },
+      ],
+    })
+    apply(fake.ctx as never, { collectOnStart: false, startDelaySeconds: 0 })
+
+    const result = await fake.tools[0]?.execute({ dryRun: false, sweepSlots: true }) as { swept: number }
+
+    // Every workspace is rewritten, including the clean one: the row cannot tell
+    // which records hide stale slots, so it must write all of them.
+    expect(result.swept).toBe(3)
+    expect(fake.calls.filter((call) => call.startsWith('setTitle'))).toEqual([
+      'setTitle:w1:W1',
+      'setTitle:w2:W2',
+      'setTitle:w3:W3',
+    ])
+    // The stale slots are gone from the durable records.
+    expect(fake.workspaces[0]?.record.sessionIds).toEqual(['alive'])
+    expect(fake.workspaces[1]?.record.sessionIds).toEqual([])
+    expect(fake.workspaces[2]?.record.sessionIds).toEqual(['alive'])
+  })
+
+  it('keeps the title unchanged while sweeping', async () => {
+    const fake = makeContext({
+      live: [],
+      workspaces: [{ id: 'w1', title: '我的项目', sessionIds: ['gone'] }],
+    })
+    apply(fake.ctx as never, { collectOnStart: false, startDelaySeconds: 0 })
+
+    await fake.tools[0]?.execute({ dryRun: false, sweepSlots: true })
+
+    expect(fake.workspaces[0]?.record.title).toBe('我的项目')
+  })
+
+  it('does not sweep during a dry run', async () => {
+    const fake = makeContext({
+      live: [],
+      workspaces: [{ id: 'w1', title: 'W1', sessionIds: ['gone'] }],
+    })
+    apply(fake.ctx as never, { collectOnStart: false, startDelaySeconds: 0 })
+
+    const result = await fake.tools[0]?.execute({ dryRun: true, sweepSlots: true }) as { swept: number }
+
+    expect(result.swept).toBe(0)
+    expect(fake.calls.filter((call) => call.startsWith('setTitle'))).toEqual([])
+    expect(fake.workspaces[0]?.record.sessionIds).toEqual(['gone'])
+  })
+
+  it('sweeps on start when sweepSlotsOnStart is on, even with an empty plan', async () => {
+    vi.useFakeTimers()
+    try {
+      const fake = makeContext({
+        live: [],
+        workspaces: [{ id: 'w1', title: 'W1', sessionIds: ['gone'] }],
+      })
+      apply(fake.ctx as never, { collectOnStart: true, startDelaySeconds: 1, sweepSlotsOnStart: true })
+
+      fake.listeners[0]?.handler()
+      await vi.runOnlyPendingTimersAsync()
+
+      // The plan is empty (nothing archived or pinned) yet the sweep still runs.
+      expect(fake.calls).toContain('setTitle:w1:W1')
+      expect(fake.workspaces[0]?.record.sessionIds).toEqual([])
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('skips the start pass entirely when the plan is empty and no sweep is configured', async () => {
+    vi.useFakeTimers()
+    try {
+      const fake = makeContext({
+        live: [],
+        workspaces: [{ id: 'w1', title: 'W1', sessionIds: ['gone'] }],
+      })
+      apply(fake.ctx as never, { collectOnStart: true, startDelaySeconds: 1, sweepSlotsOnStart: false })
+
+      fake.listeners[0]?.handler()
+      await vi.runOnlyPendingTimersAsync()
+
+      expect(fake.calls).toEqual([])
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+})
+
 describe('Config', () => {
   it('defaults to collecting on start after a short delay', () => {
     const resolved = new Config({})
     expect(resolved.collectOnStart).toBe(true)
     expect(resolved.startDelaySeconds).toBe(15)
+    expect(resolved.sweepSlotsOnStart).toBe(false)
   })
 })

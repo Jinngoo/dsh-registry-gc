@@ -10,11 +10,11 @@
 |---|---|---|
 | `global.archivedSessionIds` | **id 永久保留**，getter 无过滤 | **本插件** |
 | `global.pinnedSessionIds` | **id 永久保留**，getter 无过滤 | **本插件** |
-| `tables.workspaces[].sessionIds` | getter 实时 `candidateMatches` 过滤；且任何一次被接受的变更都会**持久化剪掉**失效槽位 | DSH 自己 |
+| `tables.workspaces[].sessionIds` | getter 实时 `candidateMatches` 过滤；原始数组不可见 | **本插件**（`sweepSlots`，见下） |
 
-前两行是源码事实：`workspaceRegistry.archivedSessionIds` 的 getter 直接 `return this.requireState().archivedSessionIds`，没有任何过滤。第三行同样有据：`WorkspaceEntity#sessionIds` 是 `this.record.sessionIds.filter(id => this.host.candidateMatches(...))`，而 `mutate()` 落盘前再 prune 一遍。
+前两行是源码事实：`workspaceRegistry.archivedSessionIds` 的 getter 直接 `return this.requireState().archivedSessionIds`，没有任何过滤。第三行同样有据：`WorkspaceEntity#sessionIds` 是 `this.record.sessionIds.filter(id => this.host.candidateMatches(...))`，所以失效槽位会被**隐藏但不会自动消失**——除非该工作区发生过一次写入。
 
-**所以本插件只做前两件。** 工作区槽位那一半 DSH 自己已经处理了——插件读到的是过滤后的视图，根本看不到悬空槽位，也就不该假装能清它。这个边界比「全都清」更窄，但它是正确的：不制造假的清理动作。
+**本插件三处都清**，但第三处的方式不同：它需要主动触发一次写操作，代价是刷新 `updatedAt`，因此默认关闭。
 
 ## 怎么做
 
@@ -48,6 +48,37 @@ WorkspaceRegistry#unpinSession(id)
 |---|---|---|
 | `collectOnStart` | `true` | 进程内首次创建 Agent 后自动清理一次 |
 | `startDelaySeconds` | `15` | 首次 Agent 出现后等多久再动手 |
+| `sweepSlotsOnStart` | `false` | 启动时顺带重写所有工作区记录，剪除不可见槽位（刷新 `updatedAt`） |
+
+## 工作区槽位：为什么需要「重写一次记录」
+
+`workspaces[].sessionIds` 的情况和上面两个集合不同：
+
+```ts
+// entity.ts:110 —— getter 每次都过滤
+get sessionIds() { return this.record.sessionIds.filter(id => this.host.candidateMatches(...)) }
+```
+
+所以失效槽位**对本插件不可见**（读到的已经是过滤后的数组），也没有任何公开 API 能读到原始数组。唯一的清除途径是让注册表**写一次这个记录**——`mutate()` 在落盘前会 prune 掉所有失配的候选：
+
+```ts
+// entity.ts:219-228
+const sessionIds = changed.sessionIds.filter(id => this.host.candidateMatches(id, changed.path))
+```
+
+`sweepSlots` 就是利用这一点：对**每个**工作区调用一次 `setTitle(它自己的标题)`。
+
+- 传相同标题也能触发写盘，因为 `setTitle` 用 `{ ...record, title }` 每次造新对象，`mutate` 的 `changed === current` 恒为 false，哨兵不会短路；
+- 剪除是那次写入的**副作用**，和标题内容无关；标题最终保持不变；
+- 因为看不到哪些记录有失效槽位，只能**全部重写一遍**（无法只挑有问题的）。
+
+**代价（已知且可选）**：`mutate()` 会顺便把 `updatedAt` 重盖章，所以被扫过的所有工作区都显示「刚刚更新」。这只会影响按 `updatedAt` 排序的调用方；按名称排序的界面无感。因为多数人不需要这个副作用，它默认关闭：
+
+| 键 | 默认 | 含义 |
+|---|---|---|
+| `sweepSlotsOnStart` | `false` | 启动时顺带重写所有工作区记录，剪除不可见槽位 |
+
+工具调用时用 `registry_gc { sweepSlots: true }` 可以按需显式触发。
 
 ## 安全性
 
