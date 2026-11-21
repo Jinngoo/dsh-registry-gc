@@ -1,0 +1,14 @@
+# This bundle inserts the registry-gc row into a profile's layer stack.
+#
+# The row is a loose host-plane row: it publishes no service and only consumes
+# host-plane registries (`tools`, `sessionPersistence`, `workspaceRegistry`), so
+# it must NOT be wrapped in a realm — a realm would cut it off from exactly those
+# services. Collection is process-wide, not per-session.
+- insert:
+    - id: registry-gc
+      name: '@jinngoo/dsh-registry-gc'
+      config:
+        # 进程内首次创建 Agent 后自动清一遍悬空 id。
+        collectOnStart: true
+        # 等首轮开始后再动注册表，避免拖慢会话创建。
+        startDelaySeconds: 15
