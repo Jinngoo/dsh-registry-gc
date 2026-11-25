@@ -68,5 +68,16 @@
     "@types/node": "^22.20.0",
     "typescript": "^5.9.0",
     "vitest": "^4.1.8"
-  }
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Jinngoo/dsh-registry-gc.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Jinngoo/dsh-registry-gc/issues"
+  },
+  "homepage": "https://github.com/Jinngoo/dsh-registry-gc#readme"
 }
